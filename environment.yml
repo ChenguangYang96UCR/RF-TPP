@@ -1,13 +1,19 @@
-name: DiT
+name: project-brc
 channels:
-  - pytorch
-  - nvidia
+    - defaults
 dependencies:
-  - python >= 3.8
-  - pytorch >= 1.13
-  - torchvision
-  - pytorch-cuda=11.7
-  - pip:
-    - timm
-    - diffusers
-    - accelerate
+    - python=3.10
+    - pip
+    - numpy
+    - scipy
+    - h5py
+    - matplotlib
+    - scikit-learn
+    - jupyter
+    - tqdm
+    - seaborn
+    - mesalib
+    - glew
+    - glfw
+    - Cython<3
+    - conda-forge::opencv

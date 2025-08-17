@@ -1,269 +1,329 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""
-A minimal training script for DiT using PyTorch DDP.
-"""
-import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
-from torchvision import transforms
+from typing import Any
+import jax.numpy as jnp
+from absl import app, flags
+from functools import partial
 import numpy as np
-from collections import OrderedDict
-from PIL import Image
-from copy import deepcopy
-from glob import glob
-from time import time
-import argparse
-import logging
-import os
+import tqdm
+import jax
+import jax.numpy as jnp
+import flax
+import optax
+import wandb
+from ml_collections import config_flags
+import ml_collections
 
-from models import DiT_models
-from diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
+from utils.wandb import setup_wandb, default_wandb_config
+from utils.train_state import TrainStateEma
+from utils.checkpoint import Checkpoint
+from utils.stable_vae import StableVAE
+from utils.sharding import create_sharding, all_gather
+from utils.datasets import get_dataset
+from model import DiT
+from helper_eval import eval_model
+from helper_inference import do_inference
 
+FLAGS = flags.FLAGS
+flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
+flags.DEFINE_string('load_dir', None, 'Logging dir (if not None, save params).')
+flags.DEFINE_string('save_dir', None, 'Logging dir (if not None, save params).')
+flags.DEFINE_string('fid_stats', None, 'FID stats file.')
+flags.DEFINE_integer('seed', 10, 'Random seed.') # Must be the same across all processes.
+flags.DEFINE_integer('log_interval', 1000, 'Logging interval.')
+flags.DEFINE_integer('eval_interval', 20000, 'Eval interval.')
+flags.DEFINE_integer('save_interval', 100000, 'Eval interval.')
+flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
+flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
+flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
+flags.DEFINE_string('mode', 'train', 'train or inference.')
 
-#################################################################################
-#                             Training Helper Functions                         #
-#################################################################################
-
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    """
-    Step the EMA model towards the current model.
-    """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-
-    for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
-
-def requires_grad(model, flag=True):
-    """
-    Set requires_grad flag for all parameters in a model.
-    """
-    for p in model.parameters():
-        p.requires_grad = flag
-
-
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
-
-
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+model_config = ml_collections.ConfigDict({
+    'lr': 0.0001,
+    'beta1': 0.9,
+    'beta2': 0.999,
+    'weight_decay': 0.1,
+    'use_cosine': 0,
+    'warmup': 0,
+    'dropout': 0.0,
+    'hidden_size': 64, # change this!
+    'patch_size': 8, # change this!
+    'depth': 2, # change this!
+    'num_heads': 2, # change this!
+    'mlp_ratio': 1, # change this!
+    'class_dropout_prob': 0.1,
+    'num_classes': 1000,
+    'denoise_timesteps': 128,
+    'cfg_scale': 4.0,
+    'target_update_rate': 0.999,
+    'use_ema': 0,
+    'use_stable_vae': 1,
+    'sharding': 'dp', # dp or fsdp.
+    't_sampling': 'discrete-dt',
+    'dt_sampling': 'uniform',
+    'bootstrap_cfg': 0,
+    'bootstrap_every': 8, # Make sure its a divisor of batch size.
+    'bootstrap_ema': 1,
+    'bootstrap_dt_bias': 0,
+    'train_type': 'shortcut' # or naive.
+})
 
 
-#################################################################################
-#                                  Training Loop                                #
-#################################################################################
+wandb_config = default_wandb_config()
+wandb_config.update({
+    'project': 'shortcut',
+    'name': 'shortcut_{dataset_name}',
+})
 
-def main(args):
-    """
-    Trains a new DiT model.
-    """
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+config_flags.DEFINE_config_dict('wandb', wandb_config, lock_config=False)
+config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
+    
+##############################################
+## Training Code.
+##############################################
+def main(_):
 
-    # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    np.random.seed(FLAGS.seed)
+    print("Using devices", jax.local_devices())
+    device_count = len(jax.local_devices())
+    global_device_count = jax.device_count()
+    print("Device count", device_count)
+    print("Global device count", global_device_count)
+    local_batch_size = FLAGS.batch_size // (global_device_count // device_count)
+    print("Global Batch: ", FLAGS.batch_size)
+    print("Node Batch: ", local_batch_size)
+    print("Device Batch:", local_batch_size // device_count)
 
-    # Setup an experiment folder:
-    if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
-        logger.info(f"Experiment directory created at {experiment_dir}")
+    # Create wandb logger
+    if jax.process_index() == 0 and FLAGS.mode == 'train':
+        setup_wandb(FLAGS.model.to_dict(), **FLAGS.wandb)
+        
+    dataset = get_dataset(FLAGS.dataset_name, local_batch_size, True, FLAGS.debug_overfit)
+    dataset_valid = get_dataset(FLAGS.dataset_name, local_batch_size, False, FLAGS.debug_overfit)
+    example_obs, example_labels = next(dataset)
+    example_obs = example_obs[:1]
+    example_obs_shape = example_obs.shape
+
+    if FLAGS.model.use_stable_vae:
+        vae = StableVAE.create()
+        if 'latent' in FLAGS.dataset_name:
+            example_obs = example_obs[:, :, :, example_obs.shape[-1] // 2:]
+            example_obs_shape = example_obs.shape
+        else:
+            example_obs = vae.encode(jax.random.PRNGKey(0), example_obs)
+        example_obs_shape = example_obs.shape
+        vae_rng = jax.random.PRNGKey(42)
+        vae_encode = jax.jit(vae.encode)
+        vae_decode = jax.jit(vae.decode)
+
+    if FLAGS.fid_stats is not None:
+        from utils.fid import get_fid_network, fid_from_stats
+        get_fid_activations = get_fid_network() 
+        truth_fid_stats = np.load(FLAGS.fid_stats)
     else:
-        logger = create_logger(None)
+        get_fid_activations = None
+        truth_fid_stats = None
 
-    # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        num_classes=args.num_classes
-    )
-    # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    ###################################
+    # Creating Model and put on devices.
+    ###################################
+    FLAGS.model.image_channels = example_obs_shape[-1]
+    FLAGS.model.image_size = example_obs_shape[1]
+    dit_args = {
+        'patch_size': FLAGS.model['patch_size'],
+        'hidden_size': FLAGS.model['hidden_size'],
+        'depth': FLAGS.model['depth'],
+        'num_heads': FLAGS.model['num_heads'],
+        'mlp_ratio': FLAGS.model['mlp_ratio'],
+        'out_channels': example_obs_shape[-1],
+        'class_dropout_prob': FLAGS.model['class_dropout_prob'],
+        'num_classes': FLAGS.model['num_classes'],
+        'dropout': FLAGS.model['dropout'],
+        'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow')) else True,
+    }
+    model_def = DiT(**dit_args)
+    tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
+    print(tabulate_fn(example_obs, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    if FLAGS.model.use_cosine:
+        lr_schedule = optax.warmup_cosine_decay_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'], FLAGS.max_steps)
+    elif FLAGS.model.warmup > 0:
+        lr_schedule = optax.linear_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'])
+    else:
+        lr_schedule = lambda x: FLAGS.model['lr']
+    adam = optax.adamw(learning_rate=lr_schedule, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'], weight_decay=FLAGS.model['weight_decay'])
+    tx = optax.chain(adam)
+    
+    def init(rng):
+        param_key, dropout_key, dropout2_key = jax.random.split(rng, 3)
+        example_t = jnp.zeros((1,))
+        example_dt = jnp.zeros((1,))
+        example_label = jnp.zeros((1,), dtype=jnp.int32)
+        example_obs = jnp.zeros(example_obs_shape)
+        model_rngs = {'params': param_key, 'label_dropout': dropout_key, 'dropout': dropout2_key}
+        params = model_def.init(model_rngs, example_obs, example_t, example_dt, example_label)['params']
+        opt_state = tx.init(params)
+        return TrainStateEma.create(model_def, params, rng=rng, tx=tx, opt_state=opt_state)
+    
+    rng = jax.random.PRNGKey(FLAGS.seed)
+    train_state_shape = jax.eval_shape(init, rng)
 
-    # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-    dataset = ImageFolder(args.data_path, transform=transform)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = create_sharding(FLAGS.model.sharding, train_state_shape)
+    train_state = jax.jit(init, out_shardings=train_state_sharding)(rng)
+    jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
+    jax.debug.visualize_array_sharding(train_state.params['TimestepEmbedder_1']['Dense_0']['kernel'])
+    jax.experimental.multihost_utils.assert_equal(train_state.params['TimestepEmbedder_1']['Dense_0']['kernel'])
+    start_step = 1
 
-    # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
+    if FLAGS.load_dir is not None:
+        cp = Checkpoint(FLAGS.load_dir)
+        replace_dict = cp.load_as_dict()['train_state']
+        del replace_dict['opt_state'] # Debug
+        train_state = train_state.replace(**replace_dict)
+        if FLAGS.wandb.run_id != "None": # If we are continuing a run.
+            start_step = train_state.step
+        train_state = jax.jit(lambda x : x, out_shardings=train_state_sharding)(train_state)
+        print("Loaded model with step", train_state.step)
+        train_state = train_state.replace(step=0)
+        jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
+        del cp
 
-    # Variables for monitoring/logging purposes:
-    train_steps = 0
-    log_steps = 0
-    running_loss = 0
-    start_time = time()
+    if FLAGS.model.train_type == 'progressive' or FLAGS.model.train_type == 'consistency-distillation':
+        train_state_teacher = jax.jit(lambda x : x, out_shardings=train_state_sharding)(train_state)
+    else:
+        train_state_teacher = None
 
-    logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
-        logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
+    visualize_labels = example_labels
+    visualize_labels = shard_data(visualize_labels)
+    visualize_labels = jax.experimental.multihost_utils.process_allgather(visualize_labels)
+    imagenet_labels = open('data/imagenet_labels.txt').read().splitlines()
 
-            # Log loss values:
-            running_loss += loss.item()
-            log_steps += 1
-            train_steps += 1
-            if train_steps % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # Reset monitoring variables:
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
+    ###################################
+    # Update Function
+    ###################################
 
-            # Save DiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+    @partial(jax.jit, out_shardings=(train_state_sharding, no_shard))
+    def update(train_state, train_state_teacher, images, labels, force_t=-1, force_dt=-1):
+        new_rng, targets_key, dropout_key, perm_key = jax.random.split(train_state.rng, 4)
+        info = {}
 
-    model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+        id_perm = jax.random.permutation(perm_key, images.shape[0])
+        images = images[id_perm]
+        labels = labels[id_perm]
+        images = jax.lax.with_sharding_constraint(images, data_sharding)
+        labels = jax.lax.with_sharding_constraint(labels, data_sharding)
 
-    logger.info("Done!")
-    cleanup()
+        if FLAGS.model['cfg_scale'] == 0: # For unconditional generation.
+            labels = jnp.ones(labels.shape[0], dtype=jnp.int32) * FLAGS.model['num_classes']
 
+        if FLAGS.model['train_type'] == 'naive':
+            from baselines.targets_naive import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'shortcut':
+            from targets_shortcut import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'progressive':
+            from baselines.targets_progressive import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, train_state_teacher, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'consistency-distillation':
+            from baselines.targets_consistency_distillation import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, train_state_teacher, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'consistency':
+            from baselines.targets_consistency_training import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
+        elif FLAGS.model['train_type'] == 'livereflow':
+            from baselines.targets_livereflow import get_targets
+            x_t, v_t, t, dt_base, labels, info = get_targets(FLAGS, targets_key, train_state, images, labels, force_t, force_dt)
 
-if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
-    args = parser.parse_args()
-    main(args)
+        def loss_fn(grad_params):
+            v_prime, logvars, activations = train_state.call_model(x_t, t, dt_base, labels, train=True, rngs={'dropout': dropout_key}, params=grad_params, return_activations=True)
+            mse_v = jnp.mean((v_prime - v_t) ** 2, axis=(1, 2, 3))
+            loss = jnp.mean(mse_v)
+
+            info = {
+                'loss': loss,
+                'v_magnitude_prime': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                **{'activations/' + k : jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()},
+            }
+
+            if FLAGS.model['train_type'] == 'shortcut' or FLAGS.model['train_type'] == 'livereflow':
+                bootstrap_size = FLAGS.batch_size // FLAGS.model['bootstrap_every']
+                info['loss_flow'] = jnp.mean(mse_v[bootstrap_size:])
+                info['loss_bootstrap'] = jnp.mean(mse_v[:bootstrap_size])
+            
+            return loss, info
+        
+        grads, new_info = jax.grad(loss_fn, has_aux=True)(train_state.params)
+        info = {**info, **new_info}
+        updates, new_opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.params)
+        new_params = optax.apply_updates(train_state.params, updates)
+
+        info['grad_norm'] = optax.global_norm(grads)
+        info['update_norm'] = optax.global_norm(updates)
+        info['param_norm'] = optax.global_norm(new_params)
+        info['lr'] = lr_schedule(train_state.step)
+
+        train_state = train_state.replace(rng=new_rng, step=train_state.step + 1, params=new_params, opt_state=new_opt_state)
+        train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
+        return train_state, info
+    
+    if FLAGS.mode != 'train':
+        do_inference(FLAGS, train_state, None, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                       get_fid_activations, imagenet_labels, visualize_labels, 
+                       fid_from_stats, truth_fid_stats)
+        return
+
+    ###################################
+    # Train Loop
+    ###################################
+
+    for i in tqdm.tqdm(range(1 + start_step, FLAGS.max_steps + 1 + start_step),
+                       smoothing=0.1,
+                       dynamic_ncols=True):
+        
+        # Sample data.
+        if not FLAGS.debug_overfit or i == 1:
+            batch_images, batch_labels = shard_data(*next(dataset))
+            if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                vae_rng, vae_key = jax.random.split(vae_rng)
+                batch_images = vae_encode(vae_key, batch_images)
+
+        # Train update.
+        train_state, update_info = update(train_state, train_state_teacher, batch_images, batch_labels)
+
+        if i % FLAGS.log_interval == 0 or i == 1:
+            update_info = jax.device_get(update_info)
+            update_info = jax.tree_map(lambda x: np.array(x), update_info)
+            update_info = jax.tree_map(lambda x: x.mean(), update_info)
+            train_metrics = {f'training/{k}': v for k, v in update_info.items()}
+
+            valid_images, valid_labels = shard_data(*next(dataset_valid))
+            if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                valid_images = vae_encode(vae_rng, valid_images)
+            _, valid_update_info = update(train_state, train_state_teacher, valid_images, valid_labels)
+            valid_update_info = jax.device_get(valid_update_info)
+            valid_update_info = jax.tree_map(lambda x: x.mean(), valid_update_info)
+            train_metrics['training/loss_valid'] = valid_update_info['loss']
+
+            if jax.process_index() == 0:
+                wandb.log(train_metrics, step=i)
+
+        if FLAGS.model['train_type'] == 'progressive':
+            num_sections = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
+            if i % (FLAGS.max_steps // num_sections) == 0:
+                train_state_teacher = jax.jit(lambda x : x, out_shardings=train_state_sharding)(train_state)
+
+        if i % FLAGS.eval_interval == 0:
+            eval_model(FLAGS, train_state, train_state_teacher, i, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
+                       get_fid_activations, imagenet_labels, visualize_labels, 
+                       fid_from_stats, truth_fid_stats)
+
+        if i % FLAGS.save_interval == 0 and FLAGS.save_dir is not None:
+            train_state_gather = jax.experimental.multihost_utils.process_allgather(train_state)
+            if jax.process_index() == 0:
+                cp = Checkpoint(FLAGS.save_dir+str(train_state_gather.step+1), parallel=False)
+                cp.train_state = train_state_gather
+                cp.save()
+                del cp
+            del train_state_gather
+
+if __name__ == '__main__':
+    app.run(main)
